@@ -5,38 +5,44 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from importlib.resources import files
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
-from streamlit_cookies_controller import CookieController
 
 
 ROOT = Path(__file__).resolve().parent
 LIBRARY = ROOT / "assets" / "screws"
 SPECS = ("M4", "M5", "M6", "M8", "M10")
 FORMATS = {".jpg", ".jpeg", ".png"}
-COOKIE = "vision_workspace_v1"
+TAB_KEY = "vision_workspace_v1"
 st.set_page_config(page_title="智造慧眼 · 螺丝检测", layout="wide", page_icon="⚙️")
+# 通过 Streamlit 的 Python 组件接口仅访问本应用的一项标签页存储。
+tab_storage = components.declare_component(
+    "vision_tab_storage", path=str(files("streamlit_session_browser_storage") / "frontend" / "build")
+)
 
 
 @st.cache_resource(ttl=3600, max_entries=32, show_spinner=False)
-def refresh_snapshot(browser_id):
-    # 每个浏览器独享临时状态。Cookie 仅含随机编号，图片保存在服务端内存。
+def refresh_snapshot(tab_id):
+    # 标签页仅持有随机恢复编号，图片与历史临时保存在服务端内存。
     return {"selected_model": None, "inputs": {}, "source": "上传图片", "history": []}
 
 
 def workspace():
-    # 固定组件位置，首次写入 Cookie 触发重绘时，正在上传的控件不会换位。
-    cookie_slot = st.container()
-    if "workbench" not in st.session_state:
-        browser_id = st.context.cookies.get(COOKIE)
-        if not browser_id:
-            browser_id = secrets.token_urlsafe(32)
-            with cookie_slot:
-                CookieController().set(COOKIE, browser_id, max_age=3600,
-                                       secure=st.context.url.startswith("https:"), same_site="lax")
-        st.session_state.workbench = refresh_snapshot(browser_id)
+    with st.container():
+        if "workbench" not in st.session_state:
+            # None 表示浏览器尚未响应；空串才表示首次访问，避免 F5 时覆盖旧编号。
+            saved = tab_storage(method="getItem", itemKey=TAB_KEY, key="read_tab",
+                                sessionStrageOptions={"defaultValue": {TAB_KEY: ""}}, default=None)
+            if saved is None:
+                st.stop()
+            st.session_state.tab_id = saved or secrets.token_urlsafe(32)
+            st.session_state.workbench = refresh_snapshot(st.session_state.tab_id)
+        tab_storage(method="setItem", itemKey=TAB_KEY, itemValue=st.session_state.tab_id,
+                    key="save_tab")
     return st.session_state.workbench
 
 

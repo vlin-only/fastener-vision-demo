@@ -1,16 +1,22 @@
-"""智造慧眼：螺丝型号库和模拟检测工作台。运行：streamlit run app.py"""
+"""启动：streamlit run app.py
+依赖：streamlit、Pillow、psutil、streamlit-browser-session-storage。
+附带的预处理页另需 opencv-python-headless 和 numpy。
+"""
 
 import base64
-import hashlib
+import random
 import secrets
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from importlib.resources import files
 from pathlib import Path
 
 import streamlit as st
+import psutil
 import streamlit.components.v1 as components
-from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageOps
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,14 +53,13 @@ def workspace():
 
 
 def mock_detect(image):
-    """模拟接口：相同像素返回相同结果，可直接替换为真实模型。坐标以原图像素计。"""
-    seed = hashlib.sha256(image.resize((48, 48)).convert("RGB").tobytes()).digest()
+    """模拟单图推理延迟和模型输出；返回原图像素坐标。"""
+    time.sleep(1)
     width, height = image.size
-    w = max(1, width * (35 + seed[2] % 36) // 100)
-    h = max(1, height * (35 + seed[3] % 36) // 100)
-    x = (width - w) * seed[4] // 255
-    y = (height - h) * seed[5] // 255
-    return {"model": SPECS[seed[0] % len(SPECS)], "confidence": (45 + seed[1] % 55) / 100,
+    w = max(1, width * random.randint(35, 70) // 100)
+    h = max(1, height * random.randint(35, 70) // 100)
+    x, y = random.randint(0, width - w), random.randint(0, height - h)
+    return {"model": random.choice(SPECS), "confidence": random.randint(45, 99) / 100,
             "boxes": [{"x": x, "y": y, "w": w, "h": h}]}
 
 
@@ -93,7 +98,7 @@ def model_library(state):
     if "model_picker" not in st.session_state:
         saved = state["selected_model"]
         st.session_state.model_picker = saved if saved in folders else folders[0]
-    selected = st.selectbox("选择型号", folders, key="model_picker")
+    selected = st.radio("选择型号", folders, key="model_picker", horizontal=True)
     state["selected_model"] = selected
     files = sorted(p for p in (LIBRARY / selected).iterdir()
                    if p.is_file() and p.suffix.lower() in FORMATS)
@@ -107,46 +112,126 @@ def model_library(state):
                 col.caption(f"{path.name} · 图片不可读")
 
 
-def update_input(source, key):
-    # 只有上传、拍照或清除控件时才替换图片。切换型号、折叠面板不会覆盖它。
-    state = st.session_state.workbench
-    state.pop("input_error", None)
-    file = st.session_state[key]
-    state["inputs"].pop(source, None)
-    if file is None:
-        return
-    data = file.getvalue()
+def log_event(state, subsystem, message):
+    clock = datetime.now(timezone(timedelta(hours=8))).strftime("%H:%M:%S")
+    state["events"].appendleft(f"[{clock}] [{subsystem}] {message}")
+
+
+def init_monitor(state):
+    if "stats" not in state:
+        state["stats"] = {"status": "在线", "total": len(state["history"]), "duration": 0.0,
+                          "last_success": None, "cpu": None}
+        state["events"] = deque(maxlen=200)
+        log_event(state, "系统", "视觉传感器待机中，等待图像输入。")
+
+
+@st.fragment(run_every=2)
+def metrics_panel():
+    """只刷新指标区域：不触发上传、推理、日志写入和历史记录。"""
+    stats = st.session_state.workbench["stats"]
     try:
-        with Image.open(BytesIO(data)) as im:
-            if im.format not in ("JPEG", "PNG"):
-                raise ValueError("unsupported image")
-            im.load()
-    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
-        state["input_error"] = "图片读取失败，请重新选择有效的 JPG 或 PNG 图片。"
-        return
-    state["inputs"][source] = {"name": file.name, "data": data, "result": None}
+        stats["cpu"] = psutil.cpu_percent(interval=0.1)
+    except (OSError, psutil.Error, NotImplementedError):
+        stats["cpu"] = None
+    rate = 0.0
+    if stats["last_success"] is not None and stats["duration"] > 0:
+        idle = time.monotonic() - stats["last_success"]
+        # 最近一次成功单图耗时（秒）换算为每分钟件数；空闲一分钟后显示 0。
+        if idle < 60:
+            rate = 60 / stats["duration"]
+    status, throughput, cpu, total = st.columns(4)
+    status.metric("设备状态", stats["status"], border=True,
+                  help="本会话检测流程状态，下一次成功识别可恢复在线。")
+    throughput.metric("当前识别吞吐量", f"{rate:.1f} 个/分钟", border=True,
+                      help="按最近一次成功单图的处理耗时估算，空闲 60 秒后归零。")
+    cpu.metric("端侧算力占用", "—" if stats["cpu"] is None else f'{stats["cpu"]:.1f}%',
+               border=True, help="应用运行主机的系统 CPU 实测值。云端部署时采样云主机。")
+    total.metric("累计处理", f'{stats["total"]} 件', border=True,
+                 help="当前会话成功完成识别的图片数，清空历史不会清零。")
 
 
-def detect_and_record(state, item, image):
-    with st.spinner("AI识别中..."):
-        result = mock_detect(image)
-        marked = draw_boxes(image, result)
-        thumbnail = jpeg_thumb(marked, (160, 120))
-        record = {"时间": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
-                  "缩略图": "data:image/jpeg;base64," + base64.b64encode(thumbnail).decode("ascii"),
-                  "文件名": item["name"], "识别结果": result["model"],
-                  "置信度": f'{result["confidence"]:.0%}'}
-        # 一次点击对应一条记录；普通页面重绘只读取已有结果。
-        item["result"] = result
-        state["history"].insert(0, record)
+def update_input(source, key):
+    state = st.session_state.workbench
+    value = st.session_state[key]
+    files_now = value if isinstance(value, list) else ([value] if value is not None else [])
+    # Streamlit 添加、删除多图时会整体重发文件列表，用上传 ID 保留已有的结果。
+    old = state["inputs"].get(source, [])
+    existing = {i["id"]: i for i in old if "id" in i} if isinstance(old, list) else {}
+    items = []
+    for file in files_now:
+        if file.file_id in existing:
+            items.append(existing[file.file_id])
+            continue
+        item = {"id": file.file_id, "name": file.name, "result": None}
+        try:
+            data = file.getvalue()
+            with Image.open(BytesIO(data)) as im:
+                if im.format not in ("JPEG", "PNG"):
+                    raise ValueError("图片格式不支持")
+                original = ImageOps.exif_transpose(im)
+                item["preview"] = jpeg_thumb(original, (600, 400))
+                width, height = original.size
+            item["data"] = data
+            log_event(state, "视觉系统", f"采集触发：{file.name}，尺寸 {width} × {height}。")
+        except (OSError, ValueError, Image.DecompressionBombError):
+            item["error"] = "图像读取失败，请选择有效的 JPG / PNG 图片。"
+            state["stats"]["status"] = "异常"
+            log_event(state, "系统", f"{file.name}：{item['error']}")
+        items.append(item)
+    state["inputs"][source] = items
+
+
+def render_log(slot, state):
+    slot.code("\n".join(state["events"]), language=None, height=185, wrap_lines=True)
+
+
+def detect_batch(state, items, slot):
+    stats = state["stats"]
+    failed = False
+    if not items:
+        stats["status"] = "异常"
+        log_event(state, "系统", "识别中止：请先上传图片或使用摄像头拍照。")
+    for item in items:
+        name = item["name"]
+        item["result"] = None
+        try:
+            if "error" in item:
+                raise ValueError(item["error"])
+            log_event(state, "算法推理", f"{name}：开始模拟识别。")
+            render_log(slot, state)
+            # 每张图独立计时，包含解码、1 秒模拟推理和生成标注缩略图。
+            started = time.perf_counter()
+            with Image.open(BytesIO(item["data"])) as im:
+                image = ImageOps.exif_transpose(im).convert("RGB")
+            result = mock_detect(image)
+            thumb = jpeg_thumb(draw_boxes(image, result), (160, 120))
+            duration = time.perf_counter() - started
+            confidence = f'{result["confidence"]:.0%}'
+            record = {"时间": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
+                      "缩略图": "data:image/jpeg;base64," + base64.b64encode(thumb).decode("ascii"),
+                      "文件名": name, "识别结果": result["model"], "置信度": confidence}
+        except Exception as exc:
+            # 单张失败仍继续处理其他图片；失败项不增加计数，也不产生成功记录。
+            failed = True
+            stats["status"] = "异常"
+            log_event(state, "系统", f"{name}：识别失败（{exc}）。")
+        else:
+            item["result"] = result
+            state["history"].insert(0, record)
+            stats.update(total=stats["total"] + 1, duration=duration, last_success=time.monotonic())
+            log_event(state, "算法推理", f'{name}：模拟匹配 {result["model"]} 螺钉，'
+                      f'置信度 {confidence}，耗时 {duration:.3f} 秒。')
+        render_log(slot, state)
+    if items:
+        stats["status"] = "异常" if failed else "在线"
+    render_log(slot, state)
 
 
 def detection_page():
-    state = workspace()
+    state = st.session_state.workbench
     with st.sidebar:
         model_library(state)
-    st.title("智造慧眼 · 螺丝视觉检测")
-    st.caption("模拟检测演示 · 型号、置信度与红色检测框由 mock_detect 生成。")
+    st.caption("型号、置信度和检测框为模拟输出。吞吐量按实测单图耗时估算，CPU 每 2 秒采样运行主机。")
     left, right = st.columns(2)
     with left.container(border=True):
         st.subheader("图像输入")
@@ -155,32 +240,46 @@ def detection_page():
         source = st.radio("图像来源", ["上传图片", "摄像头拍照"], key="source_picker", horizontal=True)
         state["source"] = source
         if source == "上传图片":
-            st.file_uploader("选择 JPG / PNG 图片", type=["jpg", "jpeg", "png"], key="upload",
-                             on_change=update_input, args=(source, "upload"))
+            st.file_uploader("选择一张或多张 JPG / PNG 图片", type=["jpg", "jpeg", "png"],
+                             accept_multiple_files=True, key="upload", on_change=update_input, args=(source, "upload"))
         else:
             st.camera_input("拍摄螺丝照片", key="camera", on_change=update_input, args=(source, "camera"))
-        if state.get("input_error"):
-            st.error(state["input_error"])
-        item = state["inputs"].get(source)
-        start = st.button("开始识别", type="primary", disabled=item is None, width="stretch")
+        items = state["inputs"].get(source, [])
+        if isinstance(items, dict):  # 兼容更新前已打开的单图会话。
+            items = [items]
+            state["inputs"][source] = items
+        for offset in range(0, len(items), 2):
+            for col, item in zip(st.columns(2), items[offset:offset + 2]):
+                if "error" in item:
+                    col.error(f'{item["name"]}：{item["error"]}')
+                else:
+                    col.image(item.get("preview") or item["data"], caption=item["name"], width="stretch")
+        start = st.button("开始识别", type="primary", width="stretch")
     with right.container(border=True):
-        st.subheader("检测预览")
-        if item is None:
-            st.info("上传或拍摄一张图片后，可在这里查看原图和检测框。")
-        else:
+        st.subheader("检测结果")
+        results = [item for item in items if item.get("result")]
+        if not results:
+            st.caption("等待开始识别。")
+        for item in results:
             with Image.open(BytesIO(item["data"])) as im:
                 image = ImageOps.exif_transpose(im).convert("RGB")
-            if start:
-                detect_and_record(state, item, image)
             result = item["result"]
-            preview = draw_boxes(image, result) if result else image
-            st.image(preview, caption=f'{item["name"]} · {image.width} × {image.height} px', width="stretch")
-            if result:
-                label = f'识别为 {result["model"]} 螺丝，置信度：{result["confidence"]:.0%}'
-                if result["confidence"] < 0.6:
-                    st.warning(f"{label}（低置信度，请复核）")
-                else:
-                    st.success(label)
+            st.image(draw_boxes(image, result), caption=item["name"], width="stretch")
+            label = f'识别为 {result["model"]} 螺丝，置信度：{result["confidence"]:.0%}'
+            if result["confidence"] < 0.6:
+                st.warning(f"{label}（低置信度，请复核）")
+            elif result["confidence"] > 0.8:
+                st.success(label)
+            else:
+                st.info(label)
+    st.subheader("实时工业日志")
+    slot = st.empty()
+    render_log(slot, state)
+    if start:
+        with st.spinner("AI识别中..."):
+            detect_batch(state, items, slot)
+        st.rerun()
+
     st.divider()
     title, clear = st.columns([4, 1])
     title.subheader("历史检测记录")
@@ -199,4 +298,9 @@ def detection_page():
 pages = [st.Page(detection_page, title="实时检测", default=True)]
 if (ROOT / "preprocessing.py").is_file():
     pages.append(st.Page("preprocessing.py", title="图像预处理调参"))
-st.navigation(pages).run()
+page = st.navigation(pages)
+state = workspace()
+init_monitor(state)
+st.title("智造慧眼 · 螺丝视觉检测" if page.title == "实时检测" else "智造慧眼 · 图像预处理调参")
+metrics_panel()
+page.run()

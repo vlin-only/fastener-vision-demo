@@ -1,116 +1,111 @@
-"""智造慧眼 · 本地工业视觉演示。启动命令：streamlit run app.py"""
+"""智造慧眼 · OpenCV 图像预处理演示。启动命令：streamlit run app.py"""
 
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
-from pathlib import PurePosixPath
-from time import monotonic
 
+import cv2
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 TITLE = "智造慧眼 —— 紧固件柔性视觉中枢"
+DISPLAY_ZONE = timezone(timedelta(hours=8))
 st.set_page_config(page_title=TITLE, page_icon="⚙", layout="wide")
 
 
-# 模块一：图像输入与网格预览
-def preview_image(file):
-    """仅在内存中解码，按 EXIF 方向纠正并缩小预览图。"""
-    with Image.open(BytesIO(file.getvalue())) as original:
-        size = original.size
-        original.thumbnail((960, 720))
-        return ImageOps.exif_transpose(original).convert("RGBA"), size
+def event(message):
+    return datetime.now(DISPLAY_ZONE).strftime("%H:%M:%S"), message
+
+
+def preview_png(image, resample=Image.Resampling.LANCZOS):
+    """仅缩小界面预览，算法始终使用原始分辨率。"""
+    image.thumbnail((960, 720), resample=resample)
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def preprocess(file):
+    data = file.getvalue()
+    with Image.open(BytesIO(data)) as source:
+        # 保留原图透明度与相机方向，使三幅预览方向一致。
+        original = preview_png(ImageOps.exif_transpose(source).convert("RGBA"))
+    color = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if color is None:
+        raise ValueError("OpenCV 无法解码图片")
+    height, width = color.shape[:2]
+    events = [event(f"视觉传感器接收到图像，尺寸：{width}x{height}")]
+    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+    del color
+    events.append(event("执行CLAHE直方图均衡化去反光..."))
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    events.append(event("执行Canny算子提取工件边缘轮廓..."))
+    edges = cv2.Canny(enhanced, 100, 200)
+    previews = (original, preview_png(Image.fromarray(enhanced)),
+                preview_png(Image.fromarray(edges), Image.Resampling.NEAREST))
+    events.append(event("预处理完成。等待接入紧固件YOLO分类模型（当前未挂载）。"))
+    return previews, (width, height), events
 
 
 def image_workspace():
-    st.html('<h2>图像采集</h2>')
+    st.html('<h2>图像预处理</h2>')
     mode = st.radio("上传方式", ["多图上传", "文件夹上传"], horizontal=True)
     directory = mode == "文件夹上传"
     files = st.file_uploader(
-        "选择图像文件夹" if directory else "选择或拖入紧固件图像",
+        "选择图像文件夹" if directory else "选择或拖入图像",
         type=["png", "jpg", "jpeg", "webp", "bmp"],
         accept_multiple_files="directory" if directory else True,
         key="folder_files" if directory else "image_files",
     )
-    st.html(
-        '<div class="sectionline"><strong>图像预览</strong>'
-        f'<span>{len(files):02d} 个文件</span></div>'
-    )
+    # 上传实例有独立 ID。同名新文件会重新处理，页面重绘沿用本会话结果。
+    active = {file.file_id for file in files}
+    results = st.session_state.setdefault("previews", {})
+    for key in results.keys() - active:
+        del results[key]
+    history = st.session_state.setdefault("processing_history", deque(maxlen=25))
     if not files:
-        st.html(
-            '<div class="empty-grid"><b>等待图像输入</b>'
-            '<span>上传后可在此查看图像和原始尺寸</span></div>'
+        st.html('<div class="empty-grid"><b>等待图像输入</b>'
+                '<span>上传后可对比原图、增强灰度图和边缘图</span></div>')
+    for file in files:
+        if file.file_id not in results:
+            try:
+                previews, size, events = preprocess(file)
+            except (UnidentifiedImageError, OSError, ValueError, cv2.error, Image.DecompressionBombError):
+                results[file.file_id] = None
+            else:
+                results[file.file_id] = (previews, size)
+                history.appendleft((file.name, events))
+        result = results[file.file_id]
+        if result is None:
+            st.warning(f"无法处理图像「{file.name}」，请检查文件内容。")
+            continue
+        previews, (width, height) = result
+        st.html(f'<div class="sectionline"><strong>{escape(file.name)}</strong>'
+                f'<span>{width} × {height} px</span></div>')
+        labels = ("原始上传图", "预处理灰度图", "边缘特征提取图")
+        for column, image, label in zip(st.columns(3), previews, labels):
+            column.image(image, caption=label, width="stretch", output_format="PNG")
+    return history
+
+
+def processing_console(history):
+    groups = []
+    for name, events in history:
+        rows = "".join(
+            f'<div class="event"><time>[{time}]</time> <span>{message}</span></div>'
+            for time, message in events
         )
-        return
-    for start in range(0, len(files), 2):
-        columns = st.columns(2)
-        for column, file in zip(columns, files[start:start + 2]):
-            name = PurePosixPath(file.name).name
-            with column:
-                try:
-                    image, (width, height) = preview_image(file)
-                except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
-                    st.warning(f"无法预览图像「{name}」，请检查文件内容。")
-                    continue
-                st.image(image, width="stretch")
-                st.html(
-                    f'<div class="fileinfo"><strong>{escape(name)}</strong>'
-                    f'<span>{width} × {height} px</span></div>'
-                )
-
-
-# 模块二：独立定时刷新的模拟控制台
-PARTS = [("M8 六角螺栓", 95, 3), ("M10 六角螺母", 98, 2), ("M6 螺钉", 97, 1)]
-
-
-def mock_event(sequence, timestamp):
-    cycle, step = divmod(sequence, 5)
-    part, confidence, channel = PARTS[cycle % len(PARTS)]
-    events = [
-        ("vision", "视觉系统", "检测到紧固件图像，采集触发。"),
-        ("frame", "图像处理", "曝光校正完成，已提取工件轮廓。"),
-        ("infer", "算法推理", f"匹配 {part}，置信度 {confidence}%。"),
-        ("route", "控制下发", f"发送串口指令 → 激活 {channel} 号包装通道。"),
-        ("ack", "设备回执", f"通道 {channel} 分拣完成，工位就绪。"),
-    ]
-    return (timestamp.strftime("%H:%M:%S"), *events[step])
-
-
-@st.fragment(run_every=0.5)
-def live_console():
-    state = st.session_state
-    now = datetime.now().astimezone()
-    tick = monotonic()
-    if "events" not in state:
-        # 用过去六秒的模拟事件填充首屏，后续仅增加新事件。
-        state.events = deque(maxlen=100)
-        for index in range(12):
-            state.events.appendleft(mock_event(index, now - timedelta(seconds=(11 - index) * 0.5)))
-        state.sequence = 12
-        state.last_tick = tick
-    else:
-        # 上传重绘、浏览器切换后台后，仍按半秒时间轴生成最近的模拟事件。
-        due = int((tick - state.last_tick) / 0.5)
-        for offset in range(max(0, due - state.events.maxlen), due):
-            scheduled = state.last_tick + (offset + 1) * 0.5
-            timestamp = now - timedelta(seconds=tick - scheduled)
-            state.events.appendleft(mock_event(state.sequence + offset, timestamp))
-        state.sequence += due
-        state.last_tick += due * 0.5
-
-    rows = "".join(
-        f'<div class="event {kind}"><time>[{timestamp}]</time>'
-        f'<div><b>{source}</b><span>{message}</span></div></div>'
-        for timestamp, kind, source, message in state.events
-    )
-    slot = st.empty()
-    slot.html(
+        groups.append(f'<div class="logfile">{escape(name)}</div>{rows}')
+    contents = "".join(groups) or '<div class="logfile">等待上传图像</div>'
+    st.html(
         '<div class="terminal"><div class="termbar"><span>● &nbsp; EVENT STREAM</span>'
-        '<span>500 ms</span></div><div class="eventlist" tabindex="0" '
-        'aria-label="模拟工业日志，最新事件在前">' + rows + '</div></div>',
+        '<span>UTC+8</span></div><div class="eventlist" tabindex="0" aria-label="预处理日志">'
+        + contents + '</div></div>'
     )
+
 
 
 # 组合页面
@@ -177,8 +172,8 @@ border-bottom:1px solid var(--line)}
 .event{display:flex;gap:12px;align-items:baseline;padding:10px 12px;border-bottom:1px solid #1c2c35;
 font-size:14px;line-height:1.55}.event:first-child{background:#102b28;box-shadow:inset 2px 0 #65e3bb}
 .event time{font:12px var(--mono);white-space:nowrap;color:#9eafb7}
-.event b{color:#83c3ec;font-weight:600;margin-right:9px}.event span{color:#d2dee2}
-.event.infer b,.event.ack b{color:var(--mint)}.event.route b{color:#e7bc83}
+.logfile{padding:9px 12px;color:var(--mint);font:14px var(--mono);overflow-wrap:anywhere;background:#13252a}.event span{color:#d2dee2}
+.sectionline strong{overflow-wrap:anywhere}
 @media(max-width:760px){.stMainBlockContainer{padding:1.2rem .9rem}.mast{gap:10px}.tag{padding:4px 7px}
 .mark{flex-basis:35px;height:35px}.st-key-vision,.st-key-console{padding:14px}.fileinfo{gap:2px}}
 </style>
@@ -190,7 +185,7 @@ def dashboard():
     st.html(
         '<div class="mast"><div class="mark" aria-hidden="true"></div><div>'
         '<div class="eyebrow">INDUSTRIAL MACHINE VISION</div>'
-        f'<h1>{TITLE}</h1></div><span class="tag">● 模拟数据</span></div>',
+        f'<h1>{TITLE}</h1></div><span class="tag">指标为模拟值</span></div>',
     )
     metrics = [
         ("status", "设备状态", "在线", "#5ccba5", [9]*28),
@@ -205,10 +200,10 @@ def dashboard():
             st.html(f'<div class="trend" aria-hidden="true" style="--color:{color}">{bars}</div>')
     left, right = st.columns([6, 4])
     with left.container(key="vision"):
-        image_workspace()
+        history = image_workspace()
     with right.container(key="console"):
-        st.html("<h2>实时工业日志</h2>")
-        live_console()
+        st.html("<h2>预处理事件日志</h2>")
+        processing_console(history)
 
 
 if __name__ == "__main__":

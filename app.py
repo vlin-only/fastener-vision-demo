@@ -1,10 +1,7 @@
-"""启动：streamlit run app.py
-依赖：streamlit、Pillow、psutil、streamlit-browser-session-storage、
-opencv-python-headless 和 numpy。
-"""
+"""启动：streamlit run app.py。识别服务随应用按需启动，依赖见 requirements.txt。"""
 
 import base64
-import random
+import math
 import secrets
 import time
 from collections import deque
@@ -19,10 +16,23 @@ import psutil
 import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageOps
 
+import backend_client
+
 
 SPECS = ("M4", "M5", "M6", "M8", "M10")
 DEFAULT_PARAMS = {"clip_limit": 2.0, "tile_size": 8, "canny_range": (50, 150)}
 TAB_KEY = "vision_workspace_v1"
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+IMAGE_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+CALIBRATION_LABELS = {
+    "caliper": "卡尺实测",
+    "ruler_endpoints": "钢尺端点",
+    "ruler_ticks": "钢尺刻线",
+    "calibrated_camera": "固定机位标定",
+}
+# 余弦相似度的复核提示线，不是概率阈值。
+LOW_REFERENCE_SIMILARITY = 0.50
+
 st.set_page_config(page_title="智造慧眼 · 螺丝检测", layout="wide", page_icon="⚙️")
 # 通过 Streamlit 的 Python 组件接口仅访问本应用的一项标签页存储。
 tab_storage = components.declare_component(
@@ -49,27 +59,6 @@ def workspace():
         tab_storage(method="setItem", itemKey=TAB_KEY, itemValue=st.session_state.tab_id,
                     key="save_tab")
     return st.session_state.workbench
-
-
-def mock_detect(image):
-    """模拟单图推理延迟和模型输出；返回原图像素坐标。"""
-    time.sleep(1)
-    width, height = image.size
-    w = max(1, width * random.randint(35, 70) // 100)
-    h = max(1, height * random.randint(35, 70) // 100)
-    x, y = random.randint(0, width - w), random.randint(0, height - h)
-    return {"model": random.choice(SPECS), "confidence": random.randint(45, 99) / 100,
-            "boxes": [{"x": x, "y": y, "w": w, "h": h}]}
-
-
-def draw_boxes(image, result):
-    marked = image.copy()
-    draw = ImageDraw.Draw(marked)
-    for box in result["boxes"]:
-        x, y, w, h = (box[key] for key in ("x", "y", "w", "h"))
-        draw.rectangle((x, y, x + w - 1, y + h - 1), outline="#ff3434",
-                       width=max(1, min(image.size) // 160))
-    return marked
 
 
 def jpeg_thumb(image, size):
@@ -137,6 +126,7 @@ def preprocess(image, params):
 
 def render_comparison(item, params, state):
     # 仅缓存当前文件、当前参数对应的预览；指标刷新和普通页面重绘不重复处理。
+    # 这里生成的增强图只用于展示，绝不发送给后端、也不参与识别。
     if item.get("preview_params") != params:
         with Image.open(BytesIO(item["data"])) as im:
             image = ImageOps.exif_transpose(im).convert("RGB")
@@ -154,8 +144,8 @@ def render_comparison(item, params, state):
     st.text(item["name"])
     original, gray, edge = st.columns(3)
     original.image(item.get("preview") or item["data"], caption="原图", width="stretch")
-    gray.image(gray_view, caption="CLAHE 灰度图", width="stretch")
-    edge.image(edge_view, caption=f"边缘图 · {ratio:.2f}%", width="stretch")
+    gray.image(gray_view, caption="CLAHE 灰度图（预览）", width="stretch")
+    edge.image(edge_view, caption=f"Canny 边缘图（预览） · {ratio:.2f}%", width="stretch")
 
 
 def log_event(state, subsystem, message):
@@ -187,13 +177,26 @@ def metrics_panel():
             rate = 60 / stats["duration"]
     status, throughput, cpu, total = st.columns(4)
     status.metric("设备状态", stats["status"], border=True,
-                  help="本会话检测流程状态，下一次成功识别可恢复在线。")
+                  help="本会话识别流程状态，下一次成功识别可恢复在线。")
     throughput.metric("当前识别吞吐量", f"{rate:.1f} 个/分钟", border=True,
                       help="按最近一次成功单图的处理耗时估算，空闲 60 秒后归零。")
     cpu.metric("端侧算力占用", "—" if stats["cpu"] is None else f'{stats["cpu"]:.1f}%',
                border=True, help="应用运行主机的系统 CPU 实测值。云端部署时采样云主机。")
     total.metric("累计处理", f'{stats["total"]} 件', border=True,
                  help="当前会话成功完成识别的图片数，清空历史不会清零。")
+
+
+def parse_diameter(raw):
+    """侧栏输入允许为空；只有有限正数才作为 X-Shank-Diameter-MM 上传。"""
+    if raw is None or not str(raw).strip():
+        return None, None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "卡尺外径必须是有限正数，留空则不上传。"
+    if not math.isfinite(value) or value <= 0:
+        return None, "卡尺外径必须是有限正数，留空则不上传。"
+    return value, None
 
 
 def update_input(source, key):
@@ -208,12 +211,17 @@ def update_input(source, key):
         if file.file_id in existing:
             items.append(existing[file.file_id])
             continue
-        item = {"id": file.file_id, "name": file.name, "result": None}
+        item = {"id": file.file_id, "name": file.name, "result": None, "feedback_token": None}
         try:
             data = file.getvalue()
+            if not data:
+                raise ValueError("图片内容为空")
+            if len(data) > MAX_IMAGE_BYTES:
+                raise ValueError("图片超过 32 MiB，请压缩后重试")
             with Image.open(BytesIO(data)) as im:
-                if im.format not in ("JPEG", "PNG"):
+                if im.format not in IMAGE_MIME:
                     raise ValueError("图片格式不支持")
+                item["mime"] = IMAGE_MIME[im.format]
                 original = ImageOps.exif_transpose(im)
                 item["preview"] = jpeg_thumb(original, (600, 400))
                 width, height = original.size
@@ -231,55 +239,190 @@ def render_log(slot, state):
     slot.code("\n".join(state["events"]), language=None, height=185, wrap_lines=True)
 
 
-def detect_batch(state, items, slot, params):
+def result_message(result):
+    cls = result["class_name"]
+    similarity = float(result["catalog_similarity"])
+    bin_text = result.get("bin")
+    bin_text = "—" if bin_text is None else str(bin_text)
+    message = f"识别为 {cls}，参考相似度 {similarity:.3f}，分箱 {bin_text}。"
+    diameter = result.get("diameter_mm")
+    if diameter is not None:
+        message = f"识别为 {cls}，参考相似度 {similarity:.3f}，分箱 {bin_text}；" \
+                  f"卡尺外径 {float(diameter):.2f} mm。"
+    return message
+
+
+def run_inference(state, items, diameter_mm, slot):
     stats = state["stats"]
     failed = False
     if not items:
         stats["status"] = "异常"
         log_event(state, "系统", "识别中止：请先上传图片或使用摄像头拍照。")
+        render_log(slot, state)
+        return
+    try:
+        backend_client.health()
+    except backend_client.BackendError as exc:
+        stats["status"] = "异常"
+        log_event(state, "系统", str(exc))
+        st.error(str(exc))
+        render_log(slot, state)
+        return
     for item in items:
         name = item["name"]
         item["result"] = None
+        item["feedback_token"] = None
+        for key in ("feedback_wrong", "feedback_done", "feedback_count", "feedback_error", "feedback_label"):
+            item.pop(key, None)
         try:
             if "error" in item:
                 raise ValueError(item["error"])
-            log_event(state, "算法推理", f"{name}：开始模拟识别。")
+            log_event(state, f"算法推理 · {name}", "开始识别，等待本机服务返回结果。")
             render_log(slot, state)
-            # 每张图独立计时，包含解码、1 秒模拟推理和生成标注缩略图。
             started = time.perf_counter()
-            with Image.open(BytesIO(item["data"])) as im:
-                image = ImageOps.exif_transpose(im).convert("RGB")
-            enhanced, _ = preprocess(image, params)
-            result = mock_detect(enhanced)
-            thumb = jpeg_thumb(draw_boxes(image, result), (160, 120))
+            payload = backend_client.predict(item["data"], item["mime"], diameter_mm)
             duration = time.perf_counter() - started
-            confidence = f'{result["confidence"]:.0%}'
-            record = {"时间": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
-                      "缩略图": "data:image/jpeg;base64," + base64.b64encode(thumb).decode("ascii"),
-                      "文件名": name, "识别结果": result["model"], "置信度": confidence}
+            similarity = payload.get("catalog_similarity")
+            if similarity is None:
+                raise backend_client.BackendError(backend_client.INVALID_RESULT)
+            similarity = float(similarity)
+            # token 单独保存，不写入历史表或日志，也不在结果区展示。
+            item["result"] = {k: v for k, v in payload.items() if k != "feedback_token"}
+            item["feedback_token"] = payload.get("feedback_token")
+            diameter = payload.get("diameter_mm")
+            record = {
+                "时间": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S"),
+                "缩略图": "data:image/jpeg;base64," + base64.b64encode(item["preview"]).decode("ascii"),
+                "文件名": name,
+                "识别结果": payload["class_name"],
+                "参考库相似度": f"{similarity:.3f}",
+                "分箱": "—" if payload.get("bin") is None else str(payload["bin"]),
+            }
+            if diameter is not None:
+                record["卡尺外径"] = f"{float(diameter):.2f} mm"
+            state["history"].insert(0, record)
+            stats.update(total=stats["total"] + 1, duration=duration, last_success=time.monotonic())
+            log_event(state, f"算法推理 · {name}", f"{result_message(item['result'])} 耗时 {duration:.3f} 秒。")
+            if similarity < LOW_REFERENCE_SIMILARITY:
+                log_event(state, f"算法推理 · {name}", "参考相似度较低，建议复核。")
+        except backend_client.BackendUnavailable as exc:
+            failed = True
+            stats["status"] = "异常"
+            st.error(str(exc))
+            log_event(state, "系统", f"{name}：{exc}")
         except Exception as exc:
             # 单张失败仍继续处理其他图片；失败项不增加计数，也不产生成功记录。
             failed = True
             stats["status"] = "异常"
+            st.warning(backend_client.INVALID_RESULT)
             log_event(state, "系统", f"{name}：识别失败（{exc}）。")
-        else:
-            item["result"] = result
-            state["history"].insert(0, record)
-            stats.update(total=stats["total"] + 1, duration=duration, last_success=time.monotonic())
-            log_event(state, "算法推理", f'{name}：模拟匹配 {result["model"]} 螺钉，'
-                      f'置信度 {confidence}，耗时 {duration:.3f} 秒。')
         render_log(slot, state)
     if items:
         stats["status"] = "异常" if failed else "在线"
     render_log(slot, state)
 
 
+def submit_feedback(item, actual, state):
+    predicted = item["result"]["class_name"]
+    try:
+        payload = backend_client.feedback(
+            item["data"], item["mime"], item.get("feedback_token"), predicted, actual
+        )
+    except backend_client.BackendError as exc:
+        item["feedback_error"] = str(exc)
+        if isinstance(exc, backend_client.FeedbackConflict):
+            item["feedback_token"] = None
+        log_event(state, "纠错反馈", f'{item["name"]}：{exc}')
+        return
+    item["feedback_done"] = True
+    item["feedback_label"] = actual
+    item["feedback_count"] = payload.get("sample_count")
+    item["feedback_error"] = None
+    change = "已按该型号更新" if payload.get("changed") else "该型号已记录过"
+    log_event(state, "纠错反馈",
+              f'{item["name"]}：{change}（{actual}），样本累计 {payload.get("sample_count")} 张。')
+
+
+def draw_center(image, center_fraction):
+    """只在原图上叠加定位十字/圆点；后端不提供检测框，这里也不画框。"""
+    marked = image.copy()
+    draw = ImageDraw.Draw(marked)
+    x = float(center_fraction[0]) * marked.width
+    y = float(center_fraction[1]) * marked.height
+    radius = max(6, min(marked.size) // 40)
+    width = max(2, min(marked.size) // 200)
+    color = (18, 120, 104)
+    draw.line((x - radius, y, x + radius, y), fill=color, width=width)
+    draw.line((x, y - radius, x, y + radius), fill=color, width=width)
+    dot = max(2, width + 1)
+    draw.ellipse((x - dot, y - dot, x + dot, y + dot), fill=color)
+    return marked
+
+
+def render_result(item, state):
+    result = item["result"]
+    cls = result["class_name"]
+    similarity = float(result["catalog_similarity"])
+    st.markdown(f"#### {cls}")
+    bin_text = result.get("bin")
+    bin_text = "—" if bin_text is None else str(bin_text)
+    st.caption(f"规格 {cls} / 分箱 {bin_text}")
+    st.metric("参考库相似度", f"{similarity:.3f}")
+    if similarity < LOW_REFERENCE_SIMILARITY:
+        st.warning("参考相似度较低，建议复核")
+    ranking = result.get("ranking") or []
+    if ranking:
+        st.caption("参考库排名（前三名）")
+        st.table([{"型号": str(row.get("class_name") or "—"),
+                   "参考库相似度": f'{float(row.get("score") or 0):.3f}'}
+                  for row in ranking[:3]])
+    diameter = result.get("diameter_mm")
+    if diameter is not None:
+        st.write(f"卡尺外径：{float(diameter):.2f} mm")
+        calibration = result.get("calibration")
+        label = CALIBRATION_LABELS.get(calibration, calibration) if calibration else "—"
+        st.caption(f"标定方式：{label}")
+    center = result.get("center_fraction")
+    if center:
+        with Image.open(BytesIO(item["data"])) as im:
+            image = ImageOps.exif_transpose(im).convert("RGB")
+        st.image(draw_center(image, center), caption="定位中心（仅供查看）", width="stretch")
+
+    token = item.get("feedback_token")
+    if not token:
+        return
+    if item.get("feedback_done"):
+        st.success(f'反馈已记录为 {item.get("feedback_label")}，样本累计 {item.get("feedback_count")} 张。')
+        return
+    st.caption("这个型号对吗？")
+    correct, wrong = st.columns(2)
+    if correct.button("识别正确", key=f"fb_ok_{item['id']}"):
+        submit_feedback(item, cls, state)
+        st.rerun()
+    if wrong.button("识别有误", key=f"fb_wrong_{item['id']}"):
+        item["feedback_wrong"] = True
+        st.rerun()
+    if item.get("feedback_wrong"):
+        actual = st.selectbox("正确型号", SPECS, key=f"fb_actual_{item['id']}")
+        if st.button("提交纠错", key=f"fb_submit_{item['id']}"):
+            submit_feedback(item, actual, state)
+            st.rerun()
+    if item.get("feedback_error"):
+        st.warning(item["feedback_error"])
+
+
 def detection_page():
     state = st.session_state.workbench
-    st.caption("型号、置信度和检测框为模拟输出。吞吐量按实测单图耗时估算，CPU 每 2 秒采样运行主机。")
+    st.caption("型号和参考库相似度由识别服务根据原图计算。CLAHE 和 Canny 用于预览。")
     with st.sidebar:
         st.subheader("预处理参数调节")
         params = parameter_controls(state)
+        st.subheader("尺寸输入（可选）")
+        raw_diameter = st.text_input("卡尺实测外径 (mm)", value="", key="caliper_diameter",
+                                     help="留空则不向后端上传尺寸；填写有限正数才生效。")
+        diameter_mm, diameter_error = parse_diameter(raw_diameter)
+        if diameter_error:
+            st.warning(diameter_error)
     acquisition, results = st.columns([1, 2])
     with acquisition.container(border=True):
         st.subheader("图像输入")
@@ -296,11 +439,6 @@ def detection_page():
         if isinstance(items, dict):  # 兼容更新前已打开的单图会话。
             items = [items]
             state["inputs"][source] = items
-        start = st.button("开始识别", type="primary", width="stretch")
-    with results.container(border=True):
-        st.subheader("图像预览与检测结果")
-        if not items:
-            st.caption("上传或拍照后，在这里查看图像。")
         for item in items:
             if "error" in item:
                 st.error(f'{item["name"]}：{item["error"]}')
@@ -309,27 +447,27 @@ def detection_page():
                 render_comparison(item, params, state)
             except (cv2.error, ValueError, OSError, Image.DecompressionBombError):
                 st.error(f'{item["name"]}：无法生成预处理图像。')
+        start = st.button("开始识别", type="primary", width="stretch")
+    with results.container(border=True):
+        st.subheader("识别结果")
+        if not items:
+            st.caption("上传或拍照后，在这里查看识别结果。")
+        for item in items:
+            if "error" in item or not item.get("result"):
                 continue
-            if not item.get("result"):
-                continue
-            with Image.open(BytesIO(item["data"])) as im:
-                image = ImageOps.exif_transpose(im).convert("RGB")
-            result = item["result"]
-            st.image(draw_boxes(image, result), caption="最近一次模拟识别", width="stretch")
-            label = f'识别为 {result["model"]} 螺丝，置信度：{result["confidence"]:.0%}'
-            if result["confidence"] < 0.6:
-                st.warning(f"{label}（低置信度，请复核）")
-            elif result["confidence"] > 0.8:
-                st.success(label)
-            else:
-                st.info(label)
+            st.markdown(f"**{item['name']}**")
+            render_result(item, state)
+            st.divider()
     st.subheader("实时工业日志")
     slot = st.empty()
     render_log(slot, state)
     if start:
-        with st.spinner("AI识别中..."):
-            detect_batch(state, items, slot, params)
-        st.rerun()
+        if diameter_error:
+            st.warning(diameter_error)
+        else:
+            with st.spinner("正在调用本机识别服务..."):
+                run_inference(state, items, diameter_mm, slot)
+            st.rerun()
 
     st.divider()
     title, clear = st.columns([4, 1])
@@ -338,9 +476,18 @@ def detection_page():
         state["history"].clear()
         st.rerun()
     if state["history"]:
-        st.dataframe(state["history"], hide_index=True, width="stretch", row_height=64,
+        allowed = {"时间", "缩略图", "文件名", "识别结果", "参考库相似度", "分箱", "卡尺外径"}
+        show_diameter = any("卡尺外径" in row for row in state["history"])
+        rows = []
+        for row in state["history"]:
+            clean = {k: v for k, v in row.items() if k in allowed}
+            if show_diameter:
+                clean.setdefault("卡尺外径", "—")
+            rows.append(clean)
+        st.dataframe(rows, hide_index=True, width="stretch", row_height=64,
                      column_config={"缩略图": st.column_config.ImageColumn("缩略图", width="small"),
-                                    "时间": st.column_config.TextColumn("时间（北京时间）")})
+                                    "时间": st.column_config.TextColumn("时间（北京时间）"),
+                                    "分箱": st.column_config.TextColumn("规格分箱")})
     else:
         st.caption("暂无检测记录。")
 

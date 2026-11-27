@@ -4,3 +4,8 @@ opencv-python-headless==4.14.0.94
 numpy>=2,<3
 streamlit-browser-session-storage==0.0.12
 psutil==7.2.2
+requests>=2.32,<3
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu
+torchvision==0.24.1+cpu
+timm==1.0.22

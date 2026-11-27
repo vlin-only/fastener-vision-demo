@@ -1,6 +1,6 @@
 """启动：streamlit run app.py
-依赖：streamlit、Pillow、psutil、streamlit-browser-session-storage。
-附带的预处理页另需 opencv-python-headless 和 numpy。
+依赖：streamlit、Pillow、psutil、streamlit-browser-session-storage、
+opencv-python-headless 和 numpy。
 """
 
 import base64
@@ -11,16 +11,17 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from importlib.resources import files
-from pathlib import Path
 
+import cv2
+import numpy as np
 import streamlit as st
 import psutil
 import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageOps
 
 
-ROOT = Path(__file__).resolve().parent
 SPECS = ("M4", "M5", "M6", "M8", "M10")
+DEFAULT_PARAMS = {"clip_limit": 2.0, "tile_size": 8, "canny_range": (50, 150)}
 TAB_KEY = "vision_workspace_v1"
 st.set_page_config(page_title="智造慧眼 · 螺丝检测", layout="wide", page_icon="⚙️")
 # 通过 Streamlit 的 Python 组件接口仅访问本应用的一项标签页存储。
@@ -77,6 +78,53 @@ def jpeg_thumb(image, size):
     buf = BytesIO()
     thumb.convert("RGB").save(buf, format="JPEG", quality=85)
     return buf.getvalue()
+
+
+def reset_params():
+    st.session_state.update(DEFAULT_PARAMS)
+
+
+def parameter_controls(state):
+    saved = state.setdefault("params", DEFAULT_PARAMS.copy())
+    for key, value in saved.items():
+        st.session_state.setdefault(key, value)
+    clip = st.slider("CLAHE 对比度限制", 1.0, 10.0, step=0.5, key="clip_limit")
+    tile = st.slider("CLAHE 分块数（N × N）", 2, 32, step=2, key="tile_size")
+    low, high = st.slider("Canny 低 / 高阈值", 0, 255, key="canny_range")
+    st.button("恢复默认参数", on_click=reset_params)
+    saved.update(clip_limit=clip, tile_size=tile, canny_range=(low, high))
+    return clip, tile, low, high
+
+
+def preprocess(image, params):
+    clip, tile, low, high = params
+    gray = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
+    enhanced = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile)).apply(gray)
+    blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+    return Image.fromarray(enhanced), cv2.Canny(blurred, low, high)
+
+
+def render_comparison(item, params, state):
+    # 仅缓存当前文件、当前参数对应的预览；指标刷新和普通页面重绘不重复处理。
+    if item.get("preview_params") != params:
+        with Image.open(BytesIO(item["data"])) as im:
+            image = ImageOps.exif_transpose(im).convert("RGB")
+        enhanced, edges = preprocess(image, params)
+        edge_view = Image.fromarray(edges)
+        edge_view.thumbnail((720, 540), Image.Resampling.NEAREST)
+        buf = BytesIO()
+        edge_view.save(buf, format="PNG")
+        item["processed_views"] = (jpeg_thumb(enhanced, (720, 540)), buf.getvalue(),
+                                   100 * np.count_nonzero(edges) / edges.size)
+        item["preview_params"] = params
+        clip, tile, low, high = params
+        log_event(state, "图像处理", f'{item["name"]}：CLAHE {clip:g} / {tile}×{tile}，Canny {low}/{high}。')
+    gray_view, edge_view, ratio = item["processed_views"]
+    st.text(item["name"])
+    original, gray, edge = st.columns(3)
+    original.image(item.get("preview") or item["data"], caption="原图", width="stretch")
+    gray.image(gray_view, caption="CLAHE 灰度图", width="stretch")
+    edge.image(edge_view, caption=f"边缘图 · {ratio:.2f}%", width="stretch")
 
 
 def log_event(state, subsystem, message):
@@ -152,7 +200,7 @@ def render_log(slot, state):
     slot.code("\n".join(state["events"]), language=None, height=185, wrap_lines=True)
 
 
-def detect_batch(state, items, slot):
+def detect_batch(state, items, slot, params):
     stats = state["stats"]
     failed = False
     if not items:
@@ -170,7 +218,8 @@ def detect_batch(state, items, slot):
             started = time.perf_counter()
             with Image.open(BytesIO(item["data"])) as im:
                 image = ImageOps.exif_transpose(im).convert("RGB")
-            result = mock_detect(image)
+            enhanced, _ = preprocess(image, params)
+            result = mock_detect(enhanced)
             thumb = jpeg_thumb(draw_boxes(image, result), (160, 120))
             duration = time.perf_counter() - started
             confidence = f'{result["confidence"]:.0%}'
@@ -197,7 +246,7 @@ def detect_batch(state, items, slot):
 def detection_page():
     state = st.session_state.workbench
     st.caption("型号、置信度和检测框为模拟输出。吞吐量按实测单图耗时估算，CPU 每 2 秒采样运行主机。")
-    left, right = st.columns(2)
+    left, right = st.columns([1, 2])
     with left.container(border=True):
         st.subheader("图像输入")
         if "source_picker" not in st.session_state:
@@ -213,6 +262,9 @@ def detection_page():
         if isinstance(items, dict):  # 兼容更新前已打开的单图会话。
             items = [items]
             state["inputs"][source] = items
+        st.divider()
+        st.subheader("预处理参数调节")
+        params = parameter_controls(state)
         start = st.button("开始识别", type="primary", width="stretch")
     with right.container(border=True):
         st.subheader("图像预览与检测结果")
@@ -222,13 +274,17 @@ def detection_page():
             if "error" in item:
                 st.error(f'{item["name"]}：{item["error"]}')
                 continue
+            try:
+                render_comparison(item, params, state)
+            except (cv2.error, ValueError, OSError, Image.DecompressionBombError):
+                st.error(f'{item["name"]}：无法生成预处理图像。')
+                continue
             if not item.get("result"):
-                st.image(item.get("preview") or item["data"], caption=item["name"], width="stretch")
                 continue
             with Image.open(BytesIO(item["data"])) as im:
                 image = ImageOps.exif_transpose(im).convert("RGB")
             result = item["result"]
-            st.image(draw_boxes(image, result), caption=item["name"], width="stretch")
+            st.image(draw_boxes(image, result), caption="最近一次模拟识别", width="stretch")
             label = f'识别为 {result["model"]} 螺丝，置信度：{result["confidence"]:.0%}'
             if result["confidence"] < 0.6:
                 st.warning(f"{label}（低置信度，请复核）")
@@ -241,7 +297,7 @@ def detection_page():
     render_log(slot, state)
     if start:
         with st.spinner("AI识别中..."):
-            detect_batch(state, items, slot)
+            detect_batch(state, items, slot, params)
         st.rerun()
 
     st.divider()
@@ -258,13 +314,8 @@ def detection_page():
         st.caption("暂无检测记录。")
 
 
-# 顶部导航用于切换检测和图像预处理。
-pages = [st.Page(detection_page, title="实时检测", default=True)]
-if (ROOT / "preprocessing.py").is_file():
-    pages.append(st.Page("preprocessing.py", title="图像预处理调参"))
-page = st.navigation(pages, position="top")
 state = workspace()
 init_monitor(state)
-st.title("智造慧眼 · 螺丝视觉检测" if page.title == "实时检测" else "智造慧眼 · 图像预处理调参")
+st.title("智造慧眼 · 螺丝视觉检测")
 metrics_panel()
-page.run()
+detection_page()

@@ -246,8 +246,11 @@ def detect_batch(state, items, slot, params):
 def detection_page():
     state = st.session_state.workbench
     st.caption("型号、置信度和检测框为模拟输出。吞吐量按实测单图耗时估算，CPU 每 2 秒采样运行主机。")
-    left, right = st.columns([1, 2])
-    with left.container(border=True):
+    controls, acquisition, results = st.columns([1, 1, 2])
+    with controls.container(border=True):
+        st.subheader("预处理参数调节")
+        params = parameter_controls(state)
+    with acquisition.container(border=True):
         st.subheader("图像输入")
         if "source_picker" not in st.session_state:
             st.session_state.source_picker = state["source"]
@@ -262,11 +265,8 @@ def detection_page():
         if isinstance(items, dict):  # 兼容更新前已打开的单图会话。
             items = [items]
             state["inputs"][source] = items
-        st.divider()
-        st.subheader("预处理参数调节")
-        params = parameter_controls(state)
         start = st.button("开始识别", type="primary", width="stretch")
-    with right.container(border=True):
+    with results.container(border=True):
         st.subheader("图像预览与检测结果")
         if not items:
             st.caption("上传或拍照后，在这里查看图像。")

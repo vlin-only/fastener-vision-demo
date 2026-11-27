@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from tempfile import gettempdir
 
@@ -29,6 +30,28 @@ def load_resources(weights, feedback_dir):
     return Resources(weights, feedback_dir)
 
 
+def show_result(panel, result):
+    model = escape(str(result["label"]))
+    box = int(result["bin"])
+    diameter = escape(str(result["size"]))
+    panel.html(f"""
+    <style>
+      .screw-result {{background:#102e2a; border:1px solid #367366;
+        border-left:5px solid #5ad8b1; border-radius:12px; padding:18px 20px;}}
+      .screw-result .reading {{display:flex; align-items:baseline; gap:8px 18px; flex-wrap:wrap;}}
+      .screw-result strong {{font:700 clamp(2.7rem,4.2vw,4.6rem)/1.05 system-ui;
+        letter-spacing:-.04em; color:#95f5d8;}}
+      .screw-result .bin {{font:600 1.4rem/1.3 system-ui; color:#eefbf7;}}
+      .screw-result .details {{display:flex; flex-wrap:wrap; gap:6px 20px; margin-top:14px;
+        padding-top:10px; border-top:1px solid #376056; color:#cae4dd; font-size:.95rem;}}
+    </style>
+    <div class="screw-result" role="group" aria-label="本次识别结果">
+      <div class="reading"><strong>{model}</strong><span class="bin">{box} 号箱</span></div>
+      <div class="details"><span>杆径：{diameter}</span>
+        <span>余弦相似度：{result['similarity']:.3f}</span></div>
+    </div>""")
+
+
 def main():
     state = st.session_state
     state.setdefault("history", [])
@@ -49,6 +72,8 @@ def main():
     metrics = st.empty()
     left, right = st.columns([2, 1])
     with right:
+        st.subheader("识别结果")
+        result_panel = st.empty()
         st.subheader("识别日志")
         log_panel = st.empty()
     with left:
@@ -72,6 +97,7 @@ def main():
         show_logs()
 
     if image_file is None:
+        result_panel.info("等待上传或拍摄图片。")
         state.update(logs=[], current=None, result=None, bgr=None, image_id=None, notice=None,
                      counted_image=None, status="在线")
     else:
@@ -89,13 +115,14 @@ def main():
         current = (image_id, params, method, value)
         if bgr is None:
             state.status = "异常"
-            original.error("图像无法解码，请重新选择有效的 JPG / PNG。")
+            result_panel.error("图像无法解码，请重新选择有效的 JPG / PNG。")
         else:
             original.image(bgr, channels="BGR", width="stretch")
             if method != "未标定" and value is None:
-                annotated.info("请填写实测标定值，或选择“未标定”直接识别。")
+                result_panel.info("请填写实测标定值，或选择“未标定”直接识别。")
             else:
                 if current != state.get("current") or retry:
+                    result_panel.info("正在识别…")
                     state.update(current=current, result=None, logs=[], notice=None)
                     log(f"收到图像 {image_file.name}，尺寸 {bgr.shape[1]} × {bgr.shape[0]} 像素。")
                     try:
@@ -122,12 +149,11 @@ def main():
                         state.notice = f"识别未完成：{exc}"
                         log(state.notice)
                 if state.get("notice"):
-                    annotated.warning(state.notice)
+                    result_panel.warning(state.notice)
                 result = state.get("result")
                 if result:
                     annotated.image(result["image"], channels="BGR", width="stretch")
-                    annotated.success(f'{result["label"]} · {result["bin"]} 号箱')
-                    annotated.caption(f'杆径：{result["size"]}　余弦相似度：{result["similarity"]:.3f}')
+                    show_result(result_panel, result)
                     with right.expander("确认或纠正型号"):
                         resources = load_resources(WEIGHTS, FEEDBACK)
                         labels = resources.model.classes

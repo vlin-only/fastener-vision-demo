@@ -20,9 +20,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 
 ROOT = Path(__file__).resolve().parent
-LIBRARY = ROOT / "assets" / "screws"
 SPECS = ("M4", "M5", "M6", "M8", "M10")
-FORMATS = {".jpg", ".jpeg", ".png"}
 TAB_KEY = "vision_workspace_v1"
 st.set_page_config(page_title="智造慧眼 · 螺丝检测", layout="wide", page_icon="⚙️")
 # 通过 Streamlit 的 Python 组件接口仅访问本应用的一项标签页存储。
@@ -34,7 +32,7 @@ tab_storage = components.declare_component(
 @st.cache_resource(ttl=3600, max_entries=32, show_spinner=False)
 def refresh_snapshot(tab_id):
     # 标签页仅持有随机恢复编号，图片与历史临时保存在服务端内存。
-    return {"selected_model": None, "inputs": {}, "source": "上传图片", "history": []}
+    return {"inputs": {}, "source": "上传图片", "history": []}
 
 
 def workspace():
@@ -79,37 +77,6 @@ def jpeg_thumb(image, size):
     buf = BytesIO()
     thumb.convert("RGB").save(buf, format="JPEG", quality=85)
     return buf.getvalue()
-
-
-@st.cache_data(show_spinner=False, max_entries=256)
-def library_thumb(path, modified):
-    # 文件修改时间参与缓存键；只缓存公共型号库，不缓存用户上传文件。
-    with Image.open(path) as im:
-        return jpeg_thumb(ImageOps.exif_transpose(im), (280, 220))
-
-
-def model_library(state):
-    st.subheader("螺丝型号库")
-    folders = [p.name for p in LIBRARY.iterdir() if p.is_dir()] if LIBRARY.is_dir() else []
-    folders.sort(key=lambda name: (SPECS.index(name) if name in SPECS else len(SPECS), name))
-    if not folders:
-        st.caption("型号库为空，请在 assets/screws 下添加分类文件夹。")
-        return
-    if "model_picker" not in st.session_state:
-        saved = state["selected_model"]
-        st.session_state.model_picker = saved if saved in folders else folders[0]
-    selected = st.radio("选择型号", folders, key="model_picker", horizontal=True)
-    state["selected_model"] = selected
-    files = sorted(p for p in (LIBRARY / selected).iterdir()
-                   if p.is_file() and p.suffix.lower() in FORMATS)
-    st.caption(f"共 {len(files)} 张 · 预览前 {min(6, len(files))} 张")
-    for start in range(0, min(6, len(files)), 2):
-        for col, path in zip(st.columns(2), files[start:start + 2]):
-            try:
-                col.image(library_thumb(path, path.stat().st_mtime_ns),
-                          caption=path.name, width="stretch")
-            except (OSError, ValueError, Image.DecompressionBombError):
-                col.caption(f"{path.name} · 图片不可读")
 
 
 def log_event(state, subsystem, message):
@@ -229,8 +196,6 @@ def detect_batch(state, items, slot):
 
 def detection_page():
     state = st.session_state.workbench
-    with st.sidebar:
-        model_library(state)
     st.caption("型号、置信度和检测框为模拟输出。吞吐量按实测单图耗时估算，CPU 每 2 秒采样运行主机。")
     left, right = st.columns(2)
     with left.container(border=True):
@@ -248,19 +213,18 @@ def detection_page():
         if isinstance(items, dict):  # 兼容更新前已打开的单图会话。
             items = [items]
             state["inputs"][source] = items
-        for offset in range(0, len(items), 2):
-            for col, item in zip(st.columns(2), items[offset:offset + 2]):
-                if "error" in item:
-                    col.error(f'{item["name"]}：{item["error"]}')
-                else:
-                    col.image(item.get("preview") or item["data"], caption=item["name"], width="stretch")
         start = st.button("开始识别", type="primary", width="stretch")
     with right.container(border=True):
-        st.subheader("检测结果")
-        results = [item for item in items if item.get("result")]
-        if not results:
-            st.caption("等待开始识别。")
-        for item in results:
+        st.subheader("图像预览与检测结果")
+        if not items:
+            st.caption("上传或拍照后，在这里查看图像。")
+        for item in items:
+            if "error" in item:
+                st.error(f'{item["name"]}：{item["error"]}')
+                continue
+            if not item.get("result"):
+                st.image(item.get("preview") or item["data"], caption=item["name"], width="stretch")
+                continue
             with Image.open(BytesIO(item["data"])) as im:
                 image = ImageOps.exif_transpose(im).convert("RGB")
             result = item["result"]
@@ -294,11 +258,11 @@ def detection_page():
         st.caption("暂无检测记录。")
 
 
-# 主入口默认为检测页；原有 CLAHE / Canny 调参工作台仍可从侧栏打开。
+# 顶部导航用于切换检测和图像预处理。
 pages = [st.Page(detection_page, title="实时检测", default=True)]
 if (ROOT / "preprocessing.py").is_file():
     pages.append(st.Page("preprocessing.py", title="图像预处理调参"))
-page = st.navigation(pages)
+page = st.navigation(pages, position="top")
 state = workspace()
 init_monitor(state)
 st.title("智造慧眼 · 螺丝视觉检测" if page.title == "实时检测" else "智造慧眼 · 图像预处理调参")
